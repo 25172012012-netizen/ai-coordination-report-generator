@@ -345,7 +345,7 @@ export function normalizeRows(rows: Record<string, any>[], sourceFilename: strin
     const customAttributes: Record<string, string> = {};
     const standardMatchedKeys = [
       'customer', 'oa', 'product', 'qty', 'quantity', 'order status', 'status',
-      'material', 'purchase', 'production', 'site', 'service', 'dispatch', 'invoice', 'payment'
+      'material', 'purchase', 'production', 'site', 'service', 'dispatch'
     ];
     for (const key of allRowKeys) {
       const isStandard = standardMatchedKeys.some(term => cleanKey(key).includes(cleanKey(term)));
@@ -354,6 +354,17 @@ export function normalizeRows(rows: Record<string, any>[], sourceFilename: strin
         customAttributes[key] = String(row[key]).trim();
         if (!presentAttributes.includes(key)) presentAttributes.push(key);
       }
+    }
+
+    // Always explicitly capture Payment Status and Invoice Status if present in document
+    // (they were previously silently dropped after being extracted)
+    if (rawPayment && rawPayment.trim()) {
+      customAttributes['Payment Status'] = rawPayment.trim();
+      if (!presentAttributes.includes('Payment Status')) presentAttributes.push('Payment Status');
+    }
+    if (rawInvoice && rawInvoice.trim()) {
+      customAttributes['Invoice Status'] = rawInvoice.trim();
+      if (!presentAttributes.includes('Invoice Status')) presentAttributes.push('Invoice Status');
     }
 
     orders.push({
