@@ -1,0 +1,57 @@
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import { URL } from 'node:url';
+
+const root = path.resolve('.');
+const publicDir = path.join(root, 'src');
+const NA = 'Not Available in Uploaded Data';
+
+function send(res, code, body, type = 'application/json') {
+  res.writeHead(code, { 'Content-Type': `${type}; charset=utf-8` }); res.end(body);
+}
+function emptyOrder(id, source) { return { orderId: id || NA, customer: NA, product: NA, quantity: NA, orderStatus: NA, purchase: { status: NA, materials: [], pendingItems: [], expectedDates: [], actions: [] }, production: { status: NA, completion: NA, targetDate: NA, pendingItems: [], actions: [] }, service: { siteStatus: NA, installation: NA, commissioning: NA, issues: [], actions: [] }, dispatch: { status: NA, plannedDate: NA, pendingItems: [], actions: [] }, sources: [source], confidence: 'Confirmed (extracted from uploaded data)' }; }
+function value(row, keys) { for (const key of keys) { const wanted=key.toLowerCase().replace(/[^a-z0-9]/g, ''); const hit=Object.keys(row).find(k => k.toLowerCase().replace(/[^a-z0-9]/g, '').includes(wanted)); if (hit) return String(row[hit] ?? '').trim(); } }
+function normalizeRows(rows, source) {
+  return rows.map(row => {
+    const ref = value(row, ['customer oa', 'oa reference', 'order no', 'order number', 'oa', 'order']);
+    const o = emptyOrder((ref?.match(/(?:oa|order)\s*[-:#]?\s*\d+[\w-]*/i)?.[0] || ref || NA).replace(/\s+/g, ' ').trim(), source);
+    o.customer = ref ? ref.replace(/\s*(?:oa|order)\s*[-:#]?\s*\d+[\w-]*/i, '').trim() || NA : value(row, ['customer', 'client']) || NA;
+    o.product = value(row, ['product', 'item', 'model']) || NA;
+    o.quantity = value(row, ['quantity', 'qty']) || NA;
+    o.orderStatus = value(row, ['order status', 'status']) || NA;
+    const payment = value(row, ['payment']); const invoice = value(row, ['invoice']); const schedule = value(row, ['dispatch schedule', 'planned dispatch', 'dispatch date']); const site = value(row, ['site status', 'site remark', 'service status']);
+    o.dispatch.status = schedule || invoice || NA; o.dispatch.plannedDate = schedule || NA;
+    o.service.siteStatus = site || NA;
+    if (/erection|install/i.test(site || '')) o.service.installation = site;
+    if (/commission/i.test(site || '')) o.service.commissioning = site;
+    if (/waiting|pending|balance/i.test(site || '')) { o.service.issues.push(site); o.service.actions.push('Resolve the site/payment issue recorded in the source before proceeding.'); }
+    if (/part dispatch|dispatch started/i.test(site || '')) o.dispatch.pendingItems.push('Part dispatch recorded; confirm remaining dispatch quantity and date.');
+    if (/no|not issued/i.test(invoice || '')) o.dispatch.pendingItems.push('Invoice is not issued.');
+    if (/balance|advance/i.test(payment || '')) o.dispatch.pendingItems.push(`Payment status: ${payment}`);
+    return o;
+  }).filter(o => o.customer !== NA || o.orderId !== NA);
+}
+function mergeOrders(orders) { const map = new Map(); for (const o of orders) { const key = o.orderId.toLowerCase().replace(/[^a-z0-9]/g, ''); const old = map.get(key); if (!old) map.set(key, o); else { old.sources.push(...o.sources.filter(x => !old.sources.includes(x))); for (const k of ['customer','product','quantity','orderStatus']) if (old[k] === NA && o[k] !== NA) old[k] = o[k]; } } return [...map.values()]; }
+function status(o, d) { const x = d === 'purchase' ? o.purchase.status : d === 'production' ? o.production.status : d === 'service' ? o.service.siteStatus : o.dispatch.status; return /\b(pending|waiting|no|not issued|part)\b/i.test(x + ' ' + (d === 'dispatch' ? o.dispatch.pendingItems.join(' ') : '')); }
+function bullet(v) { return v && v !== NA ? v : NA; }
+function action(o, department) { const d = o[department]; const known = d.actions?.[0] || d.pendingItems?.[0]; if (known) return known; if (department === 'dispatch' && d.status !== NA) return 'Confirm dispatch readiness, remaining quantity, and final dispatch date.'; if (department === 'service' && d.siteStatus !== NA) return 'Confirm current site readiness and next service activity.'; return NA; }
+export function buildReport(orders) {
+  const counts = Object.fromEntries(['purchase','production','service','dispatch'].map(d => [d, orders.filter(o => status(o,d)).length]));
+  const critical = orders.filter(o => ['purchase','production','service','dispatch'].some(d => status(o,d))).length;
+  let text = `OVERALL COORDINATION SUMMARY\n\nTotal Orders: ${orders.length}\n\nPurchase Pending: ${counts.purchase}\nProduction Pending: ${counts.production}\nService Pending: ${counts.service}\nDispatch Pending: ${counts.dispatch}\n\nCritical/Delayed Orders: ${critical}\n\n==================================================\n\n`;
+  orders.forEach((o, i) => { text += `ORDER COORDINATION REPORT — ORDER ${i + 1}\n\nDate: ${new Date().toLocaleDateString('en-GB')}\n\n==================================================\nORDER DETAILS\n\nOrder/OA No.: ${bullet(o.orderId)}\nCustomer: ${bullet(o.customer)}\nProduct: ${bullet(o.product)}\nQuantity: ${bullet(o.quantity)}\nOrder Status: ${bullet(o.orderStatus)}\n\n==================================================\nPURCHASE\n\n• Material: ${bullet(o.purchase.materials.join(', '))}\n• Availability: ${bullet(o.purchase.status)}\n• Expected Date: ${bullet(o.purchase.expectedDates.join(', '))}\n• Pending Action: ${action(o, 'purchase')}\n\n==================================================\nPRODUCTION\n\n• Status: ${bullet(o.production.status)}\n• Completion: ${bullet(o.production.completion)}\n• Target Date: ${bullet(o.production.targetDate)}\n• Pending Action: ${action(o, 'production')}\n\n==================================================\nSERVICE\n\n• Site Status: ${bullet(o.service.siteStatus)}\n• Installation: ${bullet(o.service.installation)}\n• Commissioning: ${bullet(o.service.commissioning)}\n• Pending Issue: ${bullet(o.service.issues.join('; '))}\n• Required Action: ${action(o, 'service')}\n\n==================================================\nDISPATCH\n\n• Status: ${bullet(o.dispatch.status)}\n• Planned Date: ${bullet(o.dispatch.plannedDate)}\n• Pending Requirement: ${bullet(o.dispatch.pendingItems.join('; '))}\n\n==================================================\nACTION REQUIRED\n\n1. PURCHASE: ${action(o, 'purchase')}\n2. PRODUCTION: ${action(o, 'production')}\n3. SERVICE: ${action(o, 'service')}\n4. DISPATCH: ${action(o, 'dispatch')}\n\nSource: ${o.sources.join(', ')}\nConfidence: ${o.confidence}\n\n==================================================\n\n`; }); return text;
+}
+function zipEntries(buffer) { const entries = new Map(); let p = 0; while (p < buffer.length - 30) { if (buffer.readUInt32LE(p) !== 0x04034b50) { p++; continue; } const method = buffer.readUInt16LE(p + 8), size = buffer.readUInt32LE(p + 18), nameLen = buffer.readUInt16LE(p + 26), extraLen = buffer.readUInt16LE(p + 28), name = buffer.subarray(p + 30, p + 30 + nameLen).toString(); const start = p + 30 + nameLen + extraLen; const raw = buffer.subarray(start, start + size); entries.set(name, method === 8 ? zlib.inflateRawSync(raw).toString() : raw.toString()); p = start + size; } return entries; }
+function xmlText(s) { return s.replace(/<[^>]+>/g, '').replace(/&amp;/g,'&').replace(/&#(?:x)?[0-9A-Fa-f]+;/g,' ').trim(); }
+export function parseXlsx(buffer, source) { const e = zipEntries(buffer), shared = (e.get('xl/sharedStrings.xml') || '').match(/<si[ >][\s\S]*?<\/si>/g)?.map(xmlText) || []; const sheets = [...e.keys()].filter(k => /^xl\/worksheets\/sheet\d+\.xml$/.test(k)); const all=[]; for (const file of sheets) { const rows = (e.get(file).match(/<row[ >][\s\S]*?<\/row>/g) || []).map(r => { const obj=[]; for (const cell of r.match(/<c\b[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g) || []) { const ref=(cell.match(/r="([A-Z]+)\d+"/)||[])[1]; const index=ref ? ref.split('').reduce((n,c)=>n*26+c.charCodeAt(0)-64,0)-1 : obj.length; const raw=(cell.match(/<v[^>]*>([\s\S]*?)<\/v>/)||[])[1] || ''; obj[index]=/t="s"/.test(cell) ? shared[Number(raw)] : xmlText(raw); } return obj; }); const headerIndex=rows.findIndex(r => r.some(v => /customer/i.test(v || '')) && r.some(v => /product/i.test(v || ''))); if (headerIndex >= 0) { const headers=rows[headerIndex]; all.push(...rows.slice(headerIndex+1).filter(r=>r.some(Boolean)).map(r=>Object.fromEntries(Array.from(headers,(h,i)=>[h||`Column ${i+1}`,r[i]||''])))); } } return normalizeRows(all, source); }
+function parseDocx(buffer, source) { const text=xmlText(zipEntries(buffer).get('word/document.xml') || ''); return normalizeText(text, source); }
+function parsePdf(buffer, source) { const printable=buffer.toString('latin1'); const pieces=[...printable.matchAll(/\(([^()]{2,})\)/g)].map(x=>x[1].replace(/\\[()]/g,'')); return normalizeText(pieces.join(' '), source); }
+function normalizeText(text, source) { const ids=[...text.matchAll(/(?:OA|Order(?:\s*(?:No\.?|Number))?)\s*[-:#]?\s*\d+[\w-]*/gi)].map(x=>x[0]); return ids.map(id=>emptyOrder(id,source)); }
+function parseFile(file) { const ext=path.extname(file.name).toLowerCase(); if (ext === '.xlsx') return parseXlsx(file.data,file.name); if (ext === '.docx') return parseDocx(file.data,file.name); if (ext === '.pdf') return parsePdf(file.data,file.name); if (ext === '.csv') { const [h,...rows]=file.data.toString().split(/\r?\n/).filter(Boolean).map(l=>l.split(',').map(x=>x.trim())); return normalizeRows(rows.map(r=>Object.fromEntries(h.map((x,i)=>[x,r[i]||'']))),file.name); } throw Error(`${file.name}: unsupported format`); }
+function multipart(req, body) { const b=(req.headers['content-type']||'').match(/boundary=(.+)$/)?.[1]?.replace(/^"|"$/g,''); if(!b) throw Error('Missing upload boundary'); return body.toString('latin1').split(`--${b}`).slice(1,-1).flatMap(part=>{ const x=part.indexOf('\r\n\r\n'); if(x<0)return []; const header=part.slice(0,x), data=Buffer.from(part.slice(x+4,-2),'latin1'); const name=(header.match(/filename="([^"]+)"/)||[])[1]; return name?[{name,data}]:[]; }); }
+const server=http.createServer((req,res)=>{ const url=new URL(req.url,'http://x'); if(req.method==='POST'&&url.pathname==='/api/generate'){const chunks=[]; req.on('data',c=>chunks.push(c)); req.on('end',()=>{try{const files=multipart(req,Buffer.concat(chunks));if(!files.length)throw Error('Please select at least one supported file.');const orders=mergeOrders(files.flatMap(parseFile));if(!orders.length)throw Error('No orders could be identified. Check that the document contains an order/OA reference.');send(res,200,JSON.stringify({orders,report:buildReport(orders),warnings:['Only extracted source values are shown. Missing fields remain explicitly unavailable.']}));}catch(e){send(res,400,JSON.stringify({error:e.message}));}});return;} let file=url.pathname==='/'?'index.html':url.pathname.slice(1); const target=path.join(publicDir,file); if(!target.startsWith(publicDir)||!fs.existsSync(target))return send(res,404,'Not found','text/plain'); const type=file.endsWith('.css')?'text/css':file.endsWith('.js')?'text/javascript':'text/html';send(res,200,fs.readFileSync(target),type);});
+if (process.argv[1] && path.basename(process.argv[1]) === 'index.js' && path.basename(path.dirname(process.argv[1])) === 'server') {
+  server.listen(process.env.PORT||5173,()=>console.log('AI Coordination Report Generator: http://localhost:5173'));
+}
